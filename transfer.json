@@ -1,0 +1,27 @@
+{
+    "clientContext": {
+        "clientId": "429da1a4-3b8d-44ec-8a04-6713573a9562",
+        "documents": [
+            "Passport.RUS.5624037463"
+        ]
+    },
+    "data": {
+        "SenderAccountNumber": "",
+        "IsMobileApplication": "",
+        "PaymentMethod": "",
+        "Amount": "4000",
+        "AmountType": "WithdrawAmount",
+        "Country": "RUS",
+        "BeneficiaryLastName": "Пихтурин",
+        "BeneficiaryFirstName": "Денис",
+        "BeneficiaryMiddleName": "",
+        "BeneficiaryRussiaResidence": "0", 
+        "AcceptedCurrency": "RUB",
+        "WithdrawCurrency": "RUB",
+        "FeeCurrency":"RUB",
+        "OperationPurpose": "GG",
+        "OperationAim": "GG",
+        "Phone":"79309001069",
+        "FundsSource": "продажа автотранспортного средства"
+    }
+}

@@ -1,0 +1,39 @@
+{
+    "id": "d01a0a37-cfc7-4e0e-b7c9-86e1dd12c464",
+    "countryOfResidence": "RUS",
+    "firstName": "Петр",
+    "lastName": "Первый",
+    "MiddleName": "Маркелович",
+    "gender": "Male",
+    "birthPlace": "RUS",
+    "phoneNumber": "79309001069",
+    "birthDate": "1995-05-05T00:00:00",
+    "taxpayerIndividualIdentificationNumber": "",
+    "address": {
+        "apartment": "",
+        "building": "",
+        "city": "г Можайск",
+        "countryCode": "TJK",
+        "house": "32",
+        "postcode": "143262",
+        "state": "Московская область", 
+        "street": "Ленина",
+        "district": "" 
+    },
+    "documents": [
+        {
+            "Type": "Passport.RUS",
+            "legend": null,
+            "fields": {
+                "Series": "4612",
+                "Number": "009632",
+                "Issuer": "ОУФМС г Москва",
+                "IssuerDepartmentCode": "555-360",
+                "IndividualCode":"",
+                "IssueDate": "2020-05-06T00:00:00+03:00",
+                "ExpiryDate": "2045-05-06T00:00:00+03:00",
+                "State": "RUS" 
+            }
+        }
+    ]
+}
