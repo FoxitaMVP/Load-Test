@@ -15,6 +15,7 @@ import requests
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.hazmat.primitives.serialization import pkcs12
 from email.utils import format_datetime
 from urllib.parse import urljoin, urlparse
@@ -42,7 +43,7 @@ from urllib.parse import urljoin, urlparse
 API_CREATE_CLIENT_PATH = "/v2/clients/"
 API_CREATE_TRANSFER_PATH_TEMPLATE = "/v2/operations/transfer/{guid}"
 API_GET_OPERATION_PATH_TEMPLATE = "/v2/operations/{operation_id}"
-API_SIGN_OPERATION_PATH_TEMPLATE = "/v2/operations/{operation_id}/sign"
+API_CONFIRM_OPERATION_PATH_TEMPLATE = "/v2/operations/{operation_id}/confirm"
 
 
 # ========= НАСТРОЙКИ HMAC-АВТОРИЗАЦИИ (ИЗ Postman-скрипта) =========
@@ -119,7 +120,12 @@ def _get_secret_key_bytes(app_secret: str, encoding: SecretEncoding) -> bytes:
     return _b64decode_with_padding(app_secret)
 
 
-def build_hmac_headers(method: str, full_url: str, cfg: AuthConfig) -> AuthHeaders:
+def build_hmac_headers(
+    method: str,
+    full_url: str,
+    cfg: AuthConfig,
+    content_md5: Optional[str] = None,
+) -> AuthHeaders:
     """
     Формирование заголовков Authorization / Date по правилам из auth.js.
     """
@@ -130,9 +136,14 @@ def build_hmac_headers(method: str, full_url: str, cfg: AuthConfig) -> AuthHeade
     now_utc = dt.datetime.now(dt.timezone.utc)
     date_str = format_datetime(now_utc, usegmt=True)
 
+    # Внимание: для запросов с телом (где есть Content-MD5)
+    # вторая строка canonical string = значение Content-MD5,
+    # а для запросов без тела — пустая строка.
+    md5_line = content_md5 or ""
+
     message = (
         f"{method.upper()}\n"
-        f"\n"
+        f"{md5_line}\n"
         f"{date_str}\n"
         f"{signing_path}\n"
         f"{cfg.cashier}\n"
@@ -151,8 +162,10 @@ def build_hmac_headers(method: str, full_url: str, cfg: AuthConfig) -> AuthHeade
     return AuthHeaders(authorization=auth_str, date=date_str)
 
 
-def build_common_headers(method: str, url: str, cfg: AuthConfig) -> Dict[str, str]:
-    h = build_hmac_headers(method, url, cfg)
+def build_common_headers(
+    method: str, url: str, cfg: AuthConfig, content_md5: Optional[str] = None
+) -> Dict[str, str]:
+    h = build_hmac_headers(method, url, cfg, content_md5=content_md5)
     return {
         "Authorization": h.authorization,
         "Date": h.date,
@@ -176,27 +189,30 @@ def load_pfx(pfx_path: Path, password: str) -> Tuple[Any, Optional[x509.Certific
     return key, cert
 
 
-def sign_operation_with_pfx(
-    private_key: Any, operation_id: str, extra_payload: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+def build_confirmation_pkcs7_base64(
+    private_key: Any, cert: x509.Certificate, operation_id: str
+) -> str:
     """
-    Пример локальной подписи операции.
-
-    ПРЕДПОЛОЖЕНИЕ: подписываем строку с operation_id.
-    Если спецификация другая – скорректируйте функцию.
+    Формируем CMS/PKCS#7 контейнер (base64), как в логах фронта (MII...).
+    Данные для подписи: строка operation_id в UTF-8.
     """
-    to_sign = operation_id.encode("utf-8")
-    signature = private_key.sign(
-        to_sign,
-        padding.PKCS1v15(),
-        hashes.SHA256(),
+    data = operation_id.encode("utf-8")
+    builder = pkcs7.PKCS7SignatureBuilder().set_data(data).add_signer(
+        cert, private_key, hashes.SHA256()
     )
-    signature_b64 = base64.b64encode(signature).decode("ascii")
+    der_bytes = builder.sign(
+        serialization.Encoding.DER,
+        [
+            pkcs7.PKCS7Options.Binary,
+        ],
+    )
+    return base64.b64encode(der_bytes).decode("ascii")
 
-    body = {"operationId": operation_id, "signature": signature_b64}
-    if extra_payload:
-        body.update(extra_payload)
-    return body
+
+def _content_md5_base64(body_bytes: bytes) -> str:
+    import hashlib
+
+    return base64.b64encode(hashlib.md5(body_bytes).digest()).decode("ascii")
 
 
 # ========= ГЕНЕРАЦИЯ ДАННЫХ КЛИЕНТА / ПЕРЕВОДА =========
@@ -283,6 +299,35 @@ def api_post_json(
     return data, resp
 
 
+def api_post_json_with_md5(
+    base_url: str, path: str, body: Dict[str, Any], cfg: AuthConfig
+) -> Tuple[Dict[str, Any], requests.Response]:
+    """
+    POST JSON, но сериализуем сами, чтобы корректно посчитать Content-MD5 (как во фронте).
+    """
+    url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+    body_bytes = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    content_md5 = _content_md5_base64(body_bytes)
+    headers = build_common_headers("POST", url, cfg, content_md5=content_md5)
+    headers.update(
+        {
+            "Content-Type": "application/json;encoding=utf-8",
+            "Accept": "application/json",
+            "Content-MD5": content_md5,
+        }
+    )
+    resp = requests.post(url, headers=headers, data=body_bytes, timeout=30)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": resp.text}
+    if not resp.ok:
+        raise RuntimeError(f"POST {url} failed: {resp.status_code} {data}")
+    return data, resp
+
+
 def api_get_json(
     base_url: str, path: str, cfg: AuthConfig
 ) -> Tuple[Dict[str, Any], requests.Response]:
@@ -337,16 +382,20 @@ def wait_for_operation_terminal(
     raise TimeoutError(f"Operation {operation_id} did not reach terminal status in time")
 
 
-def sign_operation(
+def confirm_operation(
     base_url: str,
     private_key: Any,
+    cert: x509.Certificate,
     operation_id: str,
     cfg: AuthConfig,
     extra_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    body = sign_operation_with_pfx(private_key, operation_id, extra_payload)
-    path = API_SIGN_OPERATION_PATH_TEMPLATE.format(operation_id=operation_id)
-    resp_data, _ = api_post_json(base_url, path, body, cfg)
+    confirmation = build_confirmation_pkcs7_base64(private_key, cert, operation_id)
+    body: Dict[str, Any] = {"confirmation": confirmation}
+    if extra_payload:
+        body.update(extra_payload)
+    path = API_CONFIRM_OPERATION_PATH_TEMPLATE.format(operation_id=operation_id)
+    resp_data, _ = api_post_json_with_md5(base_url, path, body, cfg)
     return resp_data
 
 
@@ -358,6 +407,7 @@ def run_scenario(
     client_template: Dict[str, Any],
     transfer_template: Dict[str, Any],
     private_key: Any,
+    cert: Optional[x509.Certificate],
     cfg: AuthConfig,
     thread_id: int,
 ) -> None:
@@ -402,9 +452,12 @@ def run_scenario(
             print(f"[T{thread_id}] Operation {operation_id} is not Accepted, skip signing")
             return
 
-        # 4. Подписываем операцию только при Accepted
-        sign_resp = sign_operation(base_url, private_key, operation_id, cfg)
-        print(f"[T{thread_id}] Operation {operation_id} signed, response: {sign_resp}")
+        if cert is None:
+            raise RuntimeError("PFX does not contain certificate (cert=None), cannot confirm operation")
+
+        # 4. Подтверждаем операцию только при Accepted
+        confirm_resp = confirm_operation(base_url, private_key, cert, operation_id, cfg)
+        print(f"[T{thread_id}] Operation {operation_id} confirmed, response: {confirm_resp}")
 
     except Exception as exc:
         print(f"[T{thread_id}] ERROR: {exc}")
@@ -501,6 +554,7 @@ def main() -> None:
                 client_template,
                 transfer_template,
                 private_key,
+                cert,
                 cfg,
                 i + 1,
             ),
