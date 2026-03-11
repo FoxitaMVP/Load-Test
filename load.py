@@ -369,10 +369,6 @@ def wait_for_operation_terminal(
             or data.get("operationStatus")
             or data.get("OperationStatus")
         )
-
-        # Логируем текущий статус для наглядности
-        print(f"[wait] operation {operation_id} status={status!r}")
-
         # Возвращаем при любом терминальном статусе
         if status in terminal_positive or status in terminal_negative:
             return data
@@ -425,7 +421,7 @@ def run_scenario(
             or client_payload["id"]
         )
 
-        print(f"[T{thread_id}] Client created: {client_id}")
+        print(f"[T{thread_id}] Клиент создан: {client_id}")
 
         # 2. Создаём перевод
         transfer_payload = generate_transfer_payload(transfer_template, client_payload)
@@ -435,8 +431,8 @@ def run_scenario(
         operation_id = str(uuid.uuid4())
         transfer_path = API_CREATE_TRANSFER_PATH_TEMPLATE.format(guid=operation_id)
 
-        transfer_resp, _ = api_post_json(base_url, transfer_path, transfer_payload, cfg)
-        print(f"[T{thread_id}] Transfer created, operationId={operation_id}, resp={transfer_resp}")
+        _, _ = api_post_json(base_url, transfer_path, transfer_payload, cfg)
+        print(f"[T{thread_id}] Операция создана: {operation_id}")
 
         # 3. Ждём терминальный статус (GET /v2/operations/{GUID})
         op_data = wait_for_operation_terminal(base_url, operation_id, cfg)
@@ -446,8 +442,6 @@ def run_scenario(
             or op_data.get("operationStatus")
             or op_data.get("OperationStatus")
         )
-        print(f"[T{thread_id}] Operation {operation_id} terminal status={status!r}, data={op_data}")
-
         if status != "Accepted":
             print(f"[T{thread_id}] Operation {operation_id} is not Accepted, skip signing")
             return
@@ -456,8 +450,8 @@ def run_scenario(
             raise RuntimeError("PFX does not contain certificate (cert=None), cannot confirm operation")
 
         # 4. Подтверждаем операцию только при Accepted
-        confirm_resp = confirm_operation(base_url, private_key, cert, operation_id, cfg)
-        print(f"[T{thread_id}] Operation {operation_id} confirmed, response: {confirm_resp}")
+        _ = confirm_operation(base_url, private_key, cert, operation_id, cfg)
+        print(f"[T{thread_id}] Операция подписана: {operation_id}")
 
     except Exception as exc:
         print(f"[T{thread_id}] ERROR: {exc}")
@@ -506,6 +500,24 @@ def main() -> None:
         help="Количество параллельных потоков (одна операция на поток).",
     )
     parser.add_argument(
+        "--run-mode",
+        choices=("count", "time", "forever"),
+        default="count",
+        help="Режим работы: count — фиксированное число операций, time — по времени, forever — до остановки.",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        help="Сколько операций выполнить в режиме run-mode=count (на поток).",
+    )
+    parser.add_argument(
+        "--duration-sec",
+        type=float,
+        default=60.0,
+        help="Длительность работы в секундах в режиме run-mode=time.",
+    )
+    parser.add_argument(
         "--app-id",
         default=DEFAULT_APP_ID,
         help="Application ID для UNIHMAC.",
@@ -546,20 +558,34 @@ def main() -> None:
         cash_window=args.cash_window,
         pos_id=args.pos_id,
     )
-    for i in range(args.threads):
-        t = threading.Thread(
-            target=run_scenario,
-            args=(
+    run_mode = args.run_mode
+    iterations = args.iterations
+    duration_sec = args.duration_sec
+
+    import time
+
+    start_time = time.time()
+
+    def worker(thread_id: int) -> None:
+        count = 0
+        while True:
+            if run_mode == "count" and count >= iterations:
+                return
+            if run_mode == "time" and (time.time() - start_time) >= duration_sec:
+                return
+            run_scenario(
                 args.base_url,
                 client_template,
                 transfer_template,
                 private_key,
                 cert,
                 cfg,
-                i + 1,
-            ),
-            daemon=True,
-        )
+                thread_id,
+            )
+            count += 1
+
+    for i in range(args.threads):
+        t = threading.Thread(target=worker, args=(i + 1,), daemon=True)
         threads.append(t)
         t.start()
 
