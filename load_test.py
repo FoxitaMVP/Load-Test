@@ -9,47 +9,22 @@ import uuid
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Literal
+from typing import Any, Dict, Optional, Tuple, Literal, List
 
 import requests
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.hazmat.primitives.serialization import pkcs12
 from email.utils import format_datetime
 from urllib.parse import urljoin, urlparse
 
 
-"""
-Простой скрипт для нагрузочного тестирования:
-
-1. Генерация клиента на основе JSON-шаблона (`client.json`).
-2. Создание перевода на основе JSON-шаблона (`transfer.json` и др.).
-3. Ожидание статуса операции `Accepted`.
-4. Подписание операции с помощью PFX-сертификата.
-5. Параллельный запуск нескольких потоков для нагрузки.
-
-ВАЖНО: конечные URL эндпоинтов и точный формат подписи могут отличаться.
-Отредактируйте константы `API_*` под ваш реальный API.
-"""
-
-
-# ========= НАСТРОЙКИ API (ОБЯЗАТЕЛЬНО ПРОВЕРИТЬ / ПРАВИТЬ ПОД КОНКРЕТНЫЙ СЕРВЕР) =========
-
-# Все пути ниже указываются относительно BASE_URL.
-# Пример BASE_URL: https://test.unistream.ru/opsapi_rgs/  или https://test.unistream.ru/
-
 API_CREATE_CLIENT_PATH = "/v2/clients/"
 API_CREATE_TRANSFER_PATH_TEMPLATE = "/v2/operations/transfer/{guid}"
 API_GET_OPERATION_PATH_TEMPLATE = "/v2/operations/{operation_id}"
 API_CONFIRM_OPERATION_PATH_TEMPLATE = "/v2/operations/{operation_id}/confirm"
 
-
-# ========= НАСТРОЙКИ HMAC-АВТОРИЗАЦИИ (ИЗ Postman-скрипта) =========
-#
-# ВАЖНО: эти значения зависят от окружения. Оставлены дефолты,
-# но переопределяйте через CLI-аргументы (см. --app-id/--app-secret и др.).
 
 DEFAULT_APP_ID = "4F5C53DE05C553AD756F"
 DEFAULT_APP_SECRET = (
@@ -85,10 +60,6 @@ class AuthHeaders:
 
 
 def _b64decode_with_padding(value: str) -> bytes:
-    """
-    CryptoJS спокойно парсит base64 без паддинга, а стандартный Python — нет.
-    Поэтому, если длина строки не кратна 4, добавляем '='.
-    """
     s = value.strip()
     missing = (-len(s)) % 4
     if missing:
@@ -97,16 +68,9 @@ def _b64decode_with_padding(value: str) -> bytes:
 
 
 def _build_signing_path(path: str) -> str:
-    """
-    Приводим path к формату, как в Postman-скрипте:
-    - lower()
-    - режем по '/'
-    - убираем сегмент 'opsapi_rgs'
-    - соединяем обратно
-    """
     path = path.lower()
     has_trailing_slash = path.endswith("/")
-    segments = [s for s in path.split("/") if s]  # убираем пустые, но trailing slash запомним отдельно
+    segments = [s for s in path.split("/") if s]
     filtered = [s for s in segments if s != "opsapi_rgs"]
     normalized = "/" + "/".join(filtered)
     if has_trailing_slash and not normalized.endswith("/"):
@@ -126,19 +90,12 @@ def build_hmac_headers(
     cfg: AuthConfig,
     content_md5: Optional[str] = None,
 ) -> AuthHeaders:
-    """
-    Формирование заголовков Authorization / Date по правилам из auth.js.
-    """
     parsed = urlparse(full_url)
     signing_path = _build_signing_path(parsed.path)
 
-    # Используем HTTP-дату в формате RFC 1123 (аналогично Date.toUTCString в JS, всегда EN)
     now_utc = dt.datetime.now(dt.timezone.utc)
     date_str = format_datetime(now_utc, usegmt=True)
 
-    # Внимание: для запросов с телом (где есть Content-MD5)
-    # вторая строка canonical string = значение Content-MD5,
-    # а для запросов без тела — пустая строка.
     md5_line = content_md5 or ""
 
     message = (
@@ -163,7 +120,10 @@ def build_hmac_headers(
 
 
 def build_common_headers(
-    method: str, url: str, cfg: AuthConfig, content_md5: Optional[str] = None
+    method: str,
+    url: str,
+    cfg: AuthConfig,
+    content_md5: Optional[str] = None,
 ) -> Dict[str, str]:
     h = build_hmac_headers(method, url, cfg, content_md5=content_md5)
     return {
@@ -178,34 +138,83 @@ def build_common_headers(
     }
 
 
-# ========= РАБОТА С PFX И ПОДПИСЬЮ =========
+# ========= PFX / PKCS#7 =========
 
 
-def load_pfx(pfx_path: Path, password: str) -> Tuple[Any, Optional[x509.Certificate]]:
+def load_pfx(
+    pfx_path: Path,
+    password: str,
+) -> Tuple[Any, x509.Certificate, List[x509.Certificate]]:
+    if not pfx_path.exists():
+        raise FileNotFoundError(f"PFX-файл не найден: {pfx_path}")
+
     data = pfx_path.read_bytes()
-    key, cert, _ = pkcs12.load_key_and_certificates(
-        data, password.encode("utf-8") if password else None
-    )
-    return key, cert
+
+    try:
+        private_key, cert, additional_certs = pkcs12.load_key_and_certificates(
+            data,
+            password.encode("utf-8") if password else None,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Не удалось открыть PFX. Проверь путь к файлу и пароль."
+        ) from exc
+
+    if private_key is None:
+        raise RuntimeError("PFX не содержит private key. Подписывать нечем.")
+
+    if cert is None:
+        raise RuntimeError("PFX не содержит основной сертификат.")
+
+    chain = list(additional_certs or [])
+
+    print("PFX успешно загружен")
+    print(f"Certificate subject: {cert.subject.rfc4514_string()}")
+    print(f"Certificate issuer: {cert.issuer.rfc4514_string()}")
+    print(f"Certificate valid from: {cert.not_valid_before_utc}")
+    print(f"Certificate valid until: {cert.not_valid_after_utc}")
+    print(f"Additional certificates in chain: {len(chain)}")
+
+    return private_key, cert, chain
 
 
 def build_confirmation_pkcs7_base64(
-    private_key: Any, cert: x509.Certificate, operation_id: str
+    private_key: Any,
+    cert: x509.Certificate,
+    additional_certs: List[x509.Certificate],
+    operation_id: str,
 ) -> str:
     """
-    Формируем CMS/PKCS#7 контейнер (base64), как в логах фронта (MII...).
-    Данные для подписи: строка operation_id в UTF-8.
+    Формируем CMS/PKCS#7 подпись.
+
+    Важно:
+    - PFX читается напрямую из файла.
+    - Сертификат не нужно ставить в Windows.
+    - CA-цепочка из PFX добавляется в PKCS#7.
+    - Используется detached signature, чаще всего именно её ждут API.
     """
+
     data = operation_id.encode("utf-8")
-    builder = pkcs7.PKCS7SignatureBuilder().set_data(data).add_signer(
-        cert, private_key, hashes.SHA256()
+
+    builder = pkcs7.PKCS7SignatureBuilder().set_data(data)
+
+    builder = builder.add_signer(
+        cert,
+        private_key,
+        hashes.SHA256(),
     )
+
+    for ca_cert in additional_certs:
+        builder = builder.add_certificate(ca_cert)
+
     der_bytes = builder.sign(
         serialization.Encoding.DER,
         [
             pkcs7.PKCS7Options.Binary,
+            pkcs7.PKCS7Options.DetachedSignature,
         ],
     )
+
     return base64.b64encode(der_bytes).decode("ascii")
 
 
@@ -215,10 +224,13 @@ def _content_md5_base64(body_bytes: bytes) -> str:
     return base64.b64encode(hashlib.md5(body_bytes).digest()).decode("ascii")
 
 
-# ========= ГЕНЕРАЦИЯ ДАННЫХ КЛИЕНТА / ПЕРЕВОДА =========
+# ========= JSON payload =========
 
 
 def load_json_template(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"JSON-шаблон не найден: {path}")
+
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -227,12 +239,10 @@ def generate_client_payload(template: Dict[str, Any]) -> Dict[str, Any]:
     new_id = str(uuid.uuid4())
     payload["id"] = new_id
 
-    # простой генератор телефона: 79 + 9 случайных цифр
     random_suffix = str(uuid.uuid4().int)[0:9]
     phone = "79" + random_suffix
     payload["phoneNumber"] = phone
 
-    # Документ – меняем серию/номер на псевдослучайные
     if payload.get("documents"):
         doc = payload["documents"][0]
         fields = doc.get("fields", {})
@@ -248,16 +258,19 @@ def build_document_string_from_client(payload: Dict[str, Any]) -> Optional[str]:
     docs = payload.get("documents") or []
     if not docs:
         return None
+
     doc = docs[0]
     doc_type = doc.get("Type") or "Passport.RUS"
     fields = doc.get("fields", {})
     series = fields.get("Series", "")
     number = fields.get("Number", "")
+
     return f"{doc_type}.{series}{number}"
 
 
 def generate_transfer_payload(
-    template: Dict[str, Any], client_payload: Dict[str, Any]
+    template: Dict[str, Any],
+    client_payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     payload = copy.deepcopy(template)
 
@@ -267,12 +280,13 @@ def generate_transfer_payload(
 
     client_ctx = payload.setdefault("clientContext", {})
     client_ctx["clientId"] = client_id
+
     if doc_string:
         client_ctx["documents"] = [doc_string]
 
     data = payload.setdefault("data", {})
+
     if phone:
-        # В разных шаблонах поле называется Phone или phone
         if "Phone" in data:
             data["Phone"] = phone
         elif "phone" in data:
@@ -281,36 +295,54 @@ def generate_transfer_payload(
     return payload
 
 
-# ========= ВЗАИМОДЕЙСТВИЕ С API =========
+# ========= API =========
 
 
 def api_post_json(
-    base_url: str, path: str, body: Dict[str, Any], cfg: AuthConfig
+    base_url: str,
+    path: str,
+    body: Dict[str, Any],
+    cfg: AuthConfig,
 ) -> Tuple[Dict[str, Any], requests.Response]:
     url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
     headers = build_common_headers("POST", url, cfg)
+
     resp = requests.post(url, headers=headers, json=body, timeout=30)
+
     try:
         data = resp.json()
     except Exception:
         data = {"raw": resp.text}
+
     if not resp.ok:
         raise RuntimeError(f"POST {url} failed: {resp.status_code} {data}")
+
     return data, resp
 
 
 def api_post_json_with_md5(
-    base_url: str, path: str, body: Dict[str, Any], cfg: AuthConfig
+    base_url: str,
+    path: str,
+    body: Dict[str, Any],
+    cfg: AuthConfig,
 ) -> Tuple[Dict[str, Any], requests.Response]:
-    """
-    POST JSON, но сериализуем сами, чтобы корректно посчитать Content-MD5 (как во фронте).
-    """
     url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
-    body_bytes = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode(
-        "utf-8"
-    )
+
+    body_bytes = json.dumps(
+        body,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
     content_md5 = _content_md5_base64(body_bytes)
-    headers = build_common_headers("POST", url, cfg, content_md5=content_md5)
+
+    headers = build_common_headers(
+        "POST",
+        url,
+        cfg,
+        content_md5=content_md5,
+    )
+
     headers.update(
         {
             "Content-Type": "application/json;encoding=utf-8",
@@ -318,28 +350,38 @@ def api_post_json_with_md5(
             "Content-MD5": content_md5,
         }
     )
+
     resp = requests.post(url, headers=headers, data=body_bytes, timeout=30)
+
     try:
         data = resp.json()
     except Exception:
         data = {"raw": resp.text}
+
     if not resp.ok:
         raise RuntimeError(f"POST {url} failed: {resp.status_code} {data}")
+
     return data, resp
 
 
 def api_get_json(
-    base_url: str, path: str, cfg: AuthConfig
+    base_url: str,
+    path: str,
+    cfg: AuthConfig,
 ) -> Tuple[Dict[str, Any], requests.Response]:
     url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
     headers = build_common_headers("GET", url, cfg)
+
     resp = requests.get(url, headers=headers, timeout=30)
+
     try:
         data = resp.json()
     except Exception:
         data = {"raw": resp.text}
+
     if not resp.ok:
         raise RuntimeError(f"GET {url} failed: {resp.status_code} {data}")
+
     return data, resp
 
 
@@ -347,14 +389,12 @@ def wait_for_operation_terminal(
     base_url: str,
     operation_id: str,
     cfg: AuthConfig,
-    poll_interval_sec: float = 1.0,
+    poll_interval_sec: float = 1.5,
     timeout_sec: float = 60.0,
 ) -> Dict[str, Any]:
     import time
 
     end_time = time.time() + timeout_sec
-
-    # Небольшая задержка перед первым опросом, чтобы сервер успел создать операцию
     time.sleep(poll_interval_sec)
 
     terminal_positive = {"Accepted"}
@@ -363,39 +403,54 @@ def wait_for_operation_terminal(
     while time.time() < end_time:
         path = API_GET_OPERATION_PATH_TEMPLATE.format(operation_id=operation_id)
         data, _ = api_get_json(base_url, path, cfg)
+
         status = (
             data.get("status")
             or data.get("Status")
             or data.get("operationStatus")
             or data.get("OperationStatus")
         )
-        # Возвращаем при любом терминальном статусе
+
         if status in terminal_positive or status in terminal_negative:
             return data
 
         time.sleep(poll_interval_sec)
 
-    raise TimeoutError(f"Operation {operation_id} did not reach terminal status in time")
+    raise TimeoutError(
+        f"Operation {operation_id} did not reach terminal status in time"
+    )
 
 
 def confirm_operation(
     base_url: str,
     private_key: Any,
     cert: x509.Certificate,
+    additional_certs: List[x509.Certificate],
     operation_id: str,
     cfg: AuthConfig,
     extra_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    confirmation = build_confirmation_pkcs7_base64(private_key, cert, operation_id)
-    body: Dict[str, Any] = {"confirmation": confirmation}
+    confirmation = build_confirmation_pkcs7_base64(
+        private_key=private_key,
+        cert=cert,
+        additional_certs=additional_certs,
+        operation_id=operation_id,
+    )
+
+    body: Dict[str, Any] = {
+        "confirmation": confirmation,
+    }
+
     if extra_payload:
         body.update(extra_payload)
+
     path = API_CONFIRM_OPERATION_PATH_TEMPLATE.format(operation_id=operation_id)
     resp_data, _ = api_post_json_with_md5(base_url, path, body, cfg)
+
     return resp_data
 
 
-# ========= СЦЕНАРИЙ ОДНОЙ ОПЕРАЦИИ =========
+# ========= Scenario =========
 
 
 def run_scenario(
@@ -403,18 +458,21 @@ def run_scenario(
     client_template: Dict[str, Any],
     transfer_template: Dict[str, Any],
     private_key: Any,
-    cert: Optional[x509.Certificate],
+    cert: x509.Certificate,
+    additional_certs: List[x509.Certificate],
     cfg: AuthConfig,
     thread_id: int,
 ) -> None:
     try:
-        # 1. Создаём клиента
         client_payload = generate_client_payload(client_template)
+
         client_resp, _ = api_post_json(
-            base_url, API_CREATE_CLIENT_PATH, client_payload, cfg
+            base_url,
+            API_CREATE_CLIENT_PATH,
+            client_payload,
+            cfg,
         )
 
-        # На всякий случай, если сервер возвращает id по-другому
         client_id = (
             client_resp.get("id")
             or client_resp.get("clientId")
@@ -423,131 +481,154 @@ def run_scenario(
 
         print(f"[T{thread_id}] Клиент создан: {client_id}")
 
-        # 2. Создаём перевод
-        transfer_payload = generate_transfer_payload(transfer_template, client_payload)
+        transfer_payload = generate_transfer_payload(
+            transfer_template,
+            client_payload,
+        )
 
-        # GUID для операции формируется на стороне клиента и передаётся в URL:
-        # POST /v2/operations/transfer/{GUID}
         operation_id = str(uuid.uuid4())
         transfer_path = API_CREATE_TRANSFER_PATH_TEMPLATE.format(guid=operation_id)
 
-        _, _ = api_post_json(base_url, transfer_path, transfer_payload, cfg)
+        _, _ = api_post_json(
+            base_url,
+            transfer_path,
+            transfer_payload,
+            cfg,
+        )
+
         print(f"[T{thread_id}] Операция создана: {operation_id}")
 
-        # 3. Ждём терминальный статус (GET /v2/operations/{GUID})
-        op_data = wait_for_operation_terminal(base_url, operation_id, cfg)
+        op_data = wait_for_operation_terminal(
+            base_url,
+            operation_id,
+            cfg,
+        )
+
         status = (
             op_data.get("status")
             or op_data.get("Status")
             or op_data.get("operationStatus")
             or op_data.get("OperationStatus")
         )
+
         if status != "Accepted":
-            print(f"[T{thread_id}] Operation {operation_id} is not Accepted, skip signing")
+            print(
+                f"[T{thread_id}] Operation {operation_id} is not Accepted, "
+                f"status={status}, skip signing"
+            )
             return
 
-        if cert is None:
-            raise RuntimeError("PFX does not contain certificate (cert=None), cannot confirm operation")
+        _ = confirm_operation(
+            base_url=base_url,
+            private_key=private_key,
+            cert=cert,
+            additional_certs=additional_certs,
+            operation_id=operation_id,
+            cfg=cfg,
+        )
 
-        # 4. Подтверждаем операцию только при Accepted
-        _ = confirm_operation(base_url, private_key, cert, operation_id, cfg)
         print(f"[T{thread_id}] Операция подписана: {operation_id}")
 
     except Exception as exc:
-        print(f"[T{thread_id}] ERROR: {exc}")
+        print(f"[T{thread_id}] ERROR: {repr(exc)}")
 
 
-# ========= MAIN / CLI =========
+# ========= Main =========
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Нагрузочный тест: создание клиента, перевод, подписание."
     )
+
     script_dir = Path(__file__).resolve().parent
+
     parser.add_argument(
         "--base-url",
         required=True,
-        help="Базовый URL сервера, например https://test.unistream.ru/opsapi_rgs/",
+        help="Базовый URL сервера.",
     )
+
     parser.add_argument(
         "--client-template",
         type=Path,
         default=script_dir / "client.json",
-        help="Путь к JSON-шаблону клиента (по умолчанию client.json рядом со скриптом).",
+        help="Путь к JSON-шаблону клиента.",
     )
+
     parser.add_argument(
         "--transfer-template",
         type=Path,
         default=script_dir / "transfer.json",
-        help="Путь к JSON-шаблону перевода (по умолчанию transfer.json рядом со скриптом).",
+        help="Путь к JSON-шаблону перевода.",
     )
+
     parser.add_argument(
         "--pfx-path",
         type=Path,
         required=True,
         help="Путь к PFX-файлу сертификата.",
     )
+
     parser.add_argument(
         "--pfx-password",
         required=True,
         help="Пароль к PFX-файлу.",
     )
+
     parser.add_argument(
         "--threads",
         type=int,
         default=1,
-        help="Количество параллельных потоков (одна операция на поток).",
+        help="Количество параллельных потоков.",
     )
+
     parser.add_argument(
         "--run-mode",
         choices=("count", "time", "forever"),
         default="count",
-        help="Режим работы: count — фиксированное число операций, time — по времени, forever — до остановки.",
+        help="Режим работы.",
     )
+
     parser.add_argument(
         "--iterations",
         type=int,
         default=1,
-        help="Сколько операций выполнить в режиме run-mode=count (на поток).",
+        help="Сколько операций выполнить в режиме count.",
     )
+
     parser.add_argument(
         "--duration-sec",
         type=float,
         default=60.0,
-        help="Длительность работы в секундах в режиме run-mode=time.",
+        help="Длительность работы в секундах в режиме time.",
     )
-    parser.add_argument(
-        "--app-id",
-        default=DEFAULT_APP_ID,
-        help="Application ID для UNIHMAC.",
-    )
-    parser.add_argument(
-        "--app-secret",
-        default=DEFAULT_APP_SECRET,
-        help="Секрет для UNIHMAC (обычно base64-строка).",
-    )
+
+    parser.add_argument("--app-id", default=DEFAULT_APP_ID)
+    parser.add_argument("--app-secret", default=DEFAULT_APP_SECRET)
+
     parser.add_argument(
         "--secret-encoding",
         choices=("base64", "raw"),
         default="base64",
-        help="Как интерпретировать --app-secret: base64 (по умолчанию) или raw.",
     )
+
     parser.add_argument("--cashier", default=DEFAULT_CASHIER)
     parser.add_argument("--cashier-id", default=DEFAULT_CASHIER_ID)
     parser.add_argument("--cashier-login", default=DEFAULT_CASHIER_LOGIN)
     parser.add_argument("--cash-window", default=DEFAULT_CASH_WINDOW)
     parser.add_argument("--pos-id", default=DEFAULT_POS_ID)
+
     args = parser.parse_args()
 
     client_template = load_json_template(args.client_template)
     transfer_template = load_json_template(args.transfer_template)
 
-    private_key, cert = load_pfx(args.pfx_path, args.pfx_password)
-    if cert:
-        print(f"Loaded certificate: {cert.subject.rfc4514_string()}")
+    private_key, cert, additional_certs = load_pfx(
+        args.pfx_path,
+        args.pfx_password,
+    )
 
-    threads = []
     cfg = AuthConfig(
         app_id=args.app_id,
         app_secret=args.app_secret,
@@ -558,6 +639,9 @@ def main() -> None:
         cash_window=args.cash_window,
         pos_id=args.pos_id,
     )
+
+    threads = []
+
     run_mode = args.run_mode
     iterations = args.iterations
     duration_sec = args.duration_sec
@@ -568,24 +652,33 @@ def main() -> None:
 
     def worker(thread_id: int) -> None:
         count = 0
+
         while True:
             if run_mode == "count" and count >= iterations:
                 return
+
             if run_mode == "time" and (time.time() - start_time) >= duration_sec:
                 return
+
             run_scenario(
-                args.base_url,
-                client_template,
-                transfer_template,
-                private_key,
-                cert,
-                cfg,
-                thread_id,
+                base_url=args.base_url,
+                client_template=client_template,
+                transfer_template=transfer_template,
+                private_key=private_key,
+                cert=cert,
+                additional_certs=additional_certs,
+                cfg=cfg,
+                thread_id=thread_id,
             )
+
             count += 1
 
     for i in range(args.threads):
-        t = threading.Thread(target=worker, args=(i + 1,), daemon=True)
+        t = threading.Thread(
+            target=worker,
+            args=(i + 1,),
+            daemon=True,
+        )
         threads.append(t)
         t.start()
 
